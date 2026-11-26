@@ -220,6 +220,8 @@ func bake_holes() -> void:
 		var segs:Array = _container.get_segments()
 		for _seg in segs:
 			cull_terrain_via_roadsegment(_seg)
+		for inter in _container.get_intersections():
+			cull_terrain_via_intersection(inter)
 
 	terrain.data.update_maps(TERRAIN_3D_MAPTYPE_CONTROL)
 
@@ -475,7 +477,7 @@ func flatten_terrain_via_roadsegment_raycast(segment: RoadSegment) -> void:
 	for _itemset in revert_layers:
 		var sbody: StaticBody3D = _itemset[0]
 		sbody.collision_layer = _itemset[1]
-		sbody.collision_mask = _itemset[1]
+		sbody.collision_mask = _itemset[2]
 
 
 ## Returns the distance from a 2D point to a line segment (XZ plane).
@@ -526,24 +528,10 @@ func _flatten_curve(curve: Curve3D, normalization_value: float):
 		curve.set_point_out(i,pos_out)
 
 
-func flatten_terrain_via_intersection(inter: RoadIntersection) -> void:
-	if not is_instance_valid(inter):
-		return
-	if not inter.settings is IntersectionNGon:
-		push_warning("Intersection flattening only supported for IntersectionNGon. Skipping.")
-		return
-	if not inter.edge_points.size():
-		push_warning("Intersection has no edge points. Skipping terrain flatten.")
-		return
-
-	var center_global: Vector3 = inter.global_position
-	var center_y: float = center_global.y + offset
-	var vertex_spacing: float = terrain.vertex_spacing
-
-	# Build triangle-fan boundary in world space: [side_l_0, side_r_0, side_l_1, side_r_1, ...]
-	# This relies on the fact that edge_points should already be in a clockwise order
-	var boundary_world: PackedVector2Array = PackedVector2Array()
-	var edge_heights: Array[float] = [center_y]
+## Intersection outline on the XZ plane as a triangle fan: [side_l_0, side_r_0, side_l_1, side_r_1, ...].
+## Relies on edge_points already being in clockwise order
+func intersection_boundary(inter: RoadIntersection) -> PackedVector2Array:
+	var boundary := PackedVector2Array()
 	for edge in inter.edge_points:
 		if not is_instance_valid(edge):
 			continue
@@ -559,9 +547,30 @@ func flatten_terrain_via_intersection(inter: RoadIntersection) -> void:
 			side_l = side_r
 			side_r = tmp
 
-		boundary_world.append(Vector2(side_l.x, side_l.z))
-		boundary_world.append(Vector2(side_r.x, side_r.z))
-		edge_heights.append(edge.global_position.y + offset)
+		boundary.append(Vector2(side_l.x, side_l.z))
+		boundary.append(Vector2(side_r.x, side_r.z))
+	return boundary
+
+
+func flatten_terrain_via_intersection(inter: RoadIntersection) -> void:
+	if not is_instance_valid(inter):
+		return
+	if not inter.settings is IntersectionNGon:
+		push_warning("Intersection flattening only supported for IntersectionNGon. Skipping.")
+		return
+	if not inter.edge_points.size():
+		push_warning("Intersection has no edge points. Skipping terrain flatten.")
+		return
+
+	var center_global: Vector3 = inter.global_position
+	var center_y: float = center_global.y + offset
+	var vertex_spacing: float = terrain.vertex_spacing
+
+	var boundary_world := intersection_boundary(inter)
+	var edge_heights: Array[float] = [center_y]
+	for edge in inter.edge_points:
+		if is_instance_valid(edge):
+			edge_heights.append(edge.global_position.y + offset)
 
 	# Simplification for now to just use the lowest y-height amongst all points
 	var min_height:float = edge_heights.min()
@@ -739,18 +748,15 @@ func cull_terrain_via_roadsegment(segment: RoadSegment) -> void:
 		print_debug("no mesh found for road, won't cut")
 		return
 
-	# clean up any lingering collision meshes
-	for ch in segment.road_mesh.get_children():
-		ch.queue_free()  # Prior collision meshes
-
-	# create new colission mesh for eventual raycasting
-	print_debug("creating trimesh for hole culling")
-	segment.road_mesh.create_trimesh_collision()
+	# Raycast the road's own collision, on the raycast layer for now - replacing it would leave the
+	# road without collision after baking
 	var space_states: Array[PhysicsDirectSpaceState3D] = []
+	var revert_layers: Array = []
 	for ch in segment.road_mesh.get_children():
 		var sbody := ch as StaticBody3D # Set to null if casting fails
 		if not sbody:
 			continue
+		revert_layers.append([sbody, sbody.collision_layer, sbody.collision_mask])
 		sbody.collision_layer = raycast_layer
 		sbody.collision_mask = raycast_layer
 		space_states.append(sbody.get_world_3d().direct_space_state)
@@ -793,9 +799,10 @@ func cull_terrain_via_roadsegment(segment: RoadSegment) -> void:
 			z += vertex_spacing
 		x += vertex_spacing
 
-	# free the temporary collision meshs we created
-	for ch in segment.road_mesh.get_children():
-		ch.queue_free()
+	for _itemset in revert_layers:
+		var sbody: StaticBody3D = _itemset[0]
+		sbody.collision_layer = _itemset[1]
+		sbody.collision_mask = _itemset[2]
 
 	#print(str(intersect_coords.keys()))
 	# add hole for each point which has all 8 neighbours on x-z plane
@@ -811,6 +818,37 @@ func cull_terrain_via_roadsegment(segment: RoadSegment) -> void:
 		and intersect_coords.has(Vector2(point.x + vertex_spacing,point.y - vertex_spacing)) \
 		and intersect_coords.has(Vector2(point.x - vertex_spacing,point.y + vertex_spacing)):
 			terrain.data.set_control_hole(Vector3(point.x, 0, point.y), true)
+
+
+## Holes terrain inside an intersection. Like segments, only vertices whose 8 neighbours are inside
+## too, so holed cells never reach past the outline
+func cull_terrain_via_intersection(inter: RoadIntersection) -> void:
+	if not is_instance_valid(inter) or not inter.settings is IntersectionNGon:
+		return
+	var boundary := intersection_boundary(inter)
+	if boundary.size() < 3:
+		return
+
+	var vertex_spacing: float = terrain.vertex_spacing
+	var bounds := Rect2(boundary[0], Vector2.ZERO)
+	for point in boundary:
+		bounds = bounds.expand(point)
+
+	var x := snappedf(bounds.position.x, vertex_spacing)
+	while x <= bounds.end.x:
+		var z := snappedf(bounds.position.y, vertex_spacing)
+		while z <= bounds.end.y:
+			var enclosed := true
+			for i in 9:
+				var offset_cells := Vector2(i % 3 - 1, floori(i / 3.0) - 1)
+				var neighbour := Vector2(x, z) + offset_cells * vertex_spacing
+				if not Geometry2D.is_point_in_polygon(neighbour, boundary):
+					enclosed = false
+					break
+			if enclosed and terrain.data.has_regionp(Vector3(x, 0, z)):
+				terrain.data.set_control_hole(Vector3(x, 0, z), true)
+			z += vertex_spacing
+		x += vertex_spacing
 
 
 # ------------------------------------------------------------------------------
